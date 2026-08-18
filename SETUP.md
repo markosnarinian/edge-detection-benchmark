@@ -129,48 +129,58 @@ python3 benchmark.py --skip-export --onnx-dir ./onnx --images ./my_test_images -
   see how each architecture scales with thread count (useful signal for the
   Part 3 memory-bandwidth-bound hypothesis — see `pi4_vs_pi5_notes.md`), rerun
   with `--threads 1` and `--threads 2` and compare.
-- **RF-DETR resolution constraint**: RF-DETR's exported shape must be
-  divisible by the model's block size. If `--img-size 640` fails during
-  export with a divisibility error, the error message will state the exact
-  required divisor — retry with the nearest valid multiple (672 is divisible
-  by 14, 16, and 56, so it's a reasonable first thing to try) and use the
-  **same** `--img-size` for both models so the comparison stays apples-to-apples.
+- **Resolution sweep / `--img-sizes`**: the benchmark runs across multiple
+  resolutions in one invocation (default `320,416,512,640,768,896,1024` —
+  the full practically-supported range). Both models require each resolution
+  to be a multiple of 32 (YOLOX's FPN strides top out at 32; RF-DETR Nano's
+  ViT backbone requires resolution divisible by `patch_size(16) *
+  num_windows(2) = 32`) — any entry that isn't gets dropped with a warning
+  rather than aborting the whole run. Pass a custom comma-separated list to
+  narrow the sweep, e.g. `--img-sizes 320,640,960`.
 
 ## 5. Expected runtime (Pi 4, Path A, from a clean venv)
 
 These are rough order-of-magnitude estimates, not measured — actual timing
-depends on your SD card/storage speed and network.
+depends on your SD card/storage speed, network, and how many resolutions are
+in your `--img-sizes` sweep (7 by default).
 
 | Step | Expected time |
 |---|---|
 | `pip install torch torchvision` (CPU wheels) | 3–8 min |
 | YOLOX repo clone + `requirements.txt` install | 5–15 min |
-| YOLOX checkpoint download (~8–40 MB) | <1 min |
-| YOLOX ONNX export | <1 min |
+| YOLOX checkpoint download (~8–40 MB, once, reused across resolutions) | <1 min |
+| YOLOX ONNX export (per resolution) | <1 min each, ~×7 for the default sweep |
 | `pip install rfdetr[onnx]` | 3–10 min |
-| RF-DETR checkpoint auto-download + ONNX export | 1–3 min |
-| Benchmark loop (both models, defaults: 10 warmup + 30 timed runs each) | 1–5 min (RF-DETR is expected to be the slower one per-run) |
-| **Total, Path A** | **~15–40 min**, mostly dependency installation |
-| **Total, Path B benchmark-only phase on the Pi** | **~2–7 min** |
+| RF-DETR checkpoint auto-download (once) + ONNX export (per resolution) | 1–3 min each, ~×7 for the default sweep |
+| Benchmark loop (both models × 7 resolutions, defaults: 10 warmup + 30 timed runs each) | 5–30+ min (RF-DETR is expected to be the slower one per-run, and larger resolutions scale up latency substantially) |
+| **Total, Path A** | **~30–90 min** for the default 7-resolution sweep, mostly dependency installation + the resolution loop |
+| **Total, Path B benchmark-only phase on the Pi** | **~10–40 min** for the default 7-resolution sweep |
+
+Narrow `--img-sizes` to fewer resolutions (e.g. `--img-sizes 416,640,896`) to
+cut this down for a quicker first pass.
 
 ## 6. Interpreting the output
 
 Everything lands in `--output-dir` (default `./bench_output/`):
 
-- **`results.md`** — the markdown comparison table: avg/min/max/std latency,
-  FPS, peak RSS, CPU%, ONNX file size, and how many timed runs completed per
-  model. A model that failed at any stage shows `FAILED` with its error
+- **`results.md`** — an "FPS by resolution" pivot table (quick read of the
+  speed/resolution tradeoff curve per model), followed by the full comparison
+  table: one row per model × resolution, with avg/min/max/std latency, FPS,
+  peak RSS, CPU%, ONNX file size, and how many timed runs completed. A
+  model that failed at any stage/resolution shows `FAILED` with its error
   message under the "Errors" section below the table — this is expected
-  behavior, not a bug, if e.g. RF-DETR export hits the resolution constraint.
+  behavior, not a bug, if e.g. RF-DETR export hits the resolution constraint
+  at some size.
 - **`per_run_timings.csv`** — one row per timed inference
-  (`model, run_index, latency_ms`). Use this to sanity-check for outliers
-  (e.g. a single very slow first run suggesting warmup wasn't sufficient, or
-  a rising trend suggesting thermal throttling — see §4).
+  (`model, img_size, run_index, latency_ms`). Use this to sanity-check for
+  outliers (e.g. a single very slow first run suggesting warmup wasn't
+  sufficient, or a rising trend suggesting thermal throttling — see §4).
 - **`results.json`** — the same data as `results.md`, machine-readable, handy
   if you want to paste it back for the synthesis step instead of/alongside
   the markdown table.
-- **`onnx/`** — the exported `.onnx` files themselves; useful to inspect file
-  size directly or to reuse with `--skip-export` later.
+- **`onnx/`** — the exported `.onnx` files, one subdirectory per resolution
+  (e.g. `onnx/640/yolox_nano.onnx`, `onnx/640/inference_model.onnx`); useful
+  to inspect file size directly or to reuse with `--skip-export` later.
 
 When you're ready for the synthesis step, share `results.md` (or
 `results.json`) and `per_run_timings.csv` back — that's what feeds the Pi 5
@@ -182,7 +192,7 @@ prediction in `pi4_vs_pi5_notes.md`'s §5.
 |---|---|
 | `pip install torch` hangs or takes >30 min | It's building from source — you're likely on 32-bit OS or an unsupported Python version. Switch to 64-bit Raspberry Pi OS and/or use the `--index-url https://download.pytorch.org/whl/cpu` command from §2. |
 | YOLOX `requirements.txt` install fails on `pycocotools` | Needs a C compiler: `sudo apt install -y build-essential python3-dev`. |
-| RF-DETR export fails mentioning "divisible by" | See §4's resolution-constraint note; retry with a compliant `--img-size`. |
+| RF-DETR export fails mentioning "divisible by" | See §4's resolution-sweep note; `--img-sizes` entries that aren't multiples of 32 are auto-dropped, so this should only happen with a hand-rolled non-multiple-of-32 value. |
 | `onnxruntime` import fails or is very slow | Check you have a native `aarch64` wheel (§4). Reinstall in a clean venv if unsure. |
 | Whole script exits 1 with both models `FAILED` | Check `bench_output/results.md`'s "Errors" section and the console log above it — every failure is logged with an actionable message rather than a bare traceback. Re-run with `-v` for full debug output. |
 | Latency numbers look implausibly fast/slow | Check `platform.machine()` printed at the top of the log is `aarch64` (not running under emulation), and check `vcgencmd measure_temp` for throttling. |

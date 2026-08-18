@@ -1,2 +1,4 @@
 work/
 bench_output/
+__pycache__/
+*.pyc

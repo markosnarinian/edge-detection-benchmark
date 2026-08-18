@@ -14,6 +14,9 @@ available for benchmarking right now.
 - **[`benchmark.py`](benchmark.py)** — the benchmark script. Exports official
   pretrained RF-DETR Nano and YOLOX-Nano/Tiny checkpoints to ONNX and measures
   CPU-only ONNX Runtime latency/FPS/memory/CPU%/file size on a fixed set of
-  test images. **Not yet run** — this needs to execute on the actual Pi 4.
+  test images, swept across multiple input resolutions in one run
+  (`--img-sizes`, default `320,416,512,640,768,896,1024` — the full
+  practically-supported range, since both architectures require resolutions
+  divisible by 32). **Not yet run** — this needs to execute on the actual Pi 4.
 - **[`SETUP.md`](SETUP.md)** — exact install commands, Pi-specific caveats,
   expected runtime, and how to interpret `benchmark.py`'s output files.

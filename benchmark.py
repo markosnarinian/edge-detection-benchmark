@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-CPU-only ONNX Runtime benchmark: RF-DETR Nano vs YOLOX-Nano/Tiny.
+CPU-only ONNX Runtime benchmark: RF-DETR Nano vs YOLOX-Nano/Tiny, swept across
+multiple input resolutions.
 
 Target hardware: Raspberry Pi 4 (ARM Cortex-A72, CPU-only, no accelerator).
 See SETUP.md for install instructions, Pi-specific caveats, and expected runtime.
@@ -9,7 +10,14 @@ This script is meant to run unattended on a Raspberry Pi with nobody available
 to debug it interactively. Every external operation (pip install, git clone,
 checkpoint download, ONNX export, inference) is wrapped so a single failure is
 logged clearly and skipped rather than crashing the whole run. Partial results
-(e.g. only YOLOX succeeded) are still written out.
+(e.g. only YOLOX succeeded, or only some resolutions) are still written out.
+
+Resolutions are swept via --img-sizes (comma-separated, default covers the
+full practically-supported range: 320-1024 in steps of 32). Both models
+require the resolution to be a multiple of 32 — YOLOX's FPN has strides up to
+32, and RF-DETR Nano's ViT backbone requires resolution divisible by
+patch_size(16) * num_windows(2) = 32 — so any entry that isn't a multiple of
+32 is dropped with a warning rather than failing the whole run.
 
 Typical usage on the Pi:
 
@@ -18,11 +26,14 @@ Typical usage on the Pi:
     # or, using the built-in COCO-sample / synthetic-image fallback:
     python3 benchmark.py
 
+    # sweep a custom set of resolutions instead of the default range:
+    python3 benchmark.py --img-sizes 320,640,960
+
     # export on a beefier dev machine, copy the .onnx files to the Pi, then
     # only run the timing phase on the Pi (skips the heavy torch/rfdetr/YOLOX
     # install on-device):
     python3 benchmark.py --export-only --work-dir ./work
-    # ... copy ./work/onnx/*.onnx to the Pi ...
+    # ... copy ./work/onnx/* to the Pi (one subdir per resolution) ...
     python3 benchmark.py --skip-export --onnx-dir ./work/onnx
 """
 
@@ -158,6 +169,42 @@ def download_file(url: str, dest: Path, timeout: int = 60, retries: int = 2) -> 
 
 def human_mb(num_bytes: float) -> float:
     return round(num_bytes / (1024 * 1024), 2)
+
+
+DEFAULT_IMG_SIZES = "320,416,512,640,768,896,1024"
+
+
+def parse_img_sizes(raw: str) -> list[int]:
+    """Parse a comma-separated --img-sizes value into a sorted, deduplicated
+    list of valid resolutions. Both models require the resolution to be a
+    multiple of 32 (YOLOX's FPN strides; RF-DETR Nano's patch_size(16) *
+    num_windows(2)); invalid entries are dropped with a warning rather than
+    aborting the whole sweep."""
+    sizes: set[int] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            v = int(tok)
+        except ValueError:
+            log.warning("Ignoring non-integer --img-sizes entry: %r", tok)
+            continue
+        if v <= 0:
+            log.warning("Ignoring non-positive --img-sizes entry: %d", v)
+            continue
+        if v % 32 != 0:
+            nearest = max(32, round(v / 32) * 32)
+            log.warning(
+                "Ignoring --img-sizes entry %d: not a multiple of 32, which both "
+                "YOLOX (FPN strides) and RF-DETR Nano (patch_size*num_windows) "
+                "require. Nearest valid value: %d.",
+                v,
+                nearest,
+            )
+            continue
+        sizes.add(v)
+    return sorted(sizes)
 
 
 # --------------------------------------------------------------------------
@@ -335,7 +382,7 @@ def export_yolox_onnx(
         exp_file = repo_dir / YOLOX_EXP_FILE[variant]
         exp = get_exp(str(exp_file), None)
         # Override the experiment's default 416x416 test size so both models
-        # are compared at the same --img-size (default 640x640).
+        # are compared at the same resolution for each entry in --img-sizes.
         exp.test_size = (img_size, img_size)
 
         model = exp.get_model()
@@ -413,10 +460,10 @@ def export_rfdetr_onnx(img_size: int, out_dir: Path, opset: int) -> Optional[Pat
     except Exception as e:
         log.error(
             "RFDETRNano(resolution=%d) failed to construct: %s\n"
-            "RF-DETR requires the resolution to be divisible by the model's "
-            "block size (patch_size * num_windows). If the error above mentions "
-            "divisibility, try a nearby multiple (e.g. 672) via --img-size and "
-            "re-run.",
+            "RF-DETR Nano requires the resolution to be divisible by "
+            "patch_size(16) * num_windows(2) = 32 (this should already be "
+            "enforced by --img-sizes validation; if you're seeing this, check "
+            "for a version mismatch in the installed rfdetr package).",
             img_size,
             e,
         )
@@ -434,9 +481,10 @@ def export_rfdetr_onnx(img_size: int, out_dir: Path, opset: int) -> Optional[Pat
         )
     except Exception as e:
         log.error(
-            "RF-DETR export() failed: %s\n"
-            "If this mentions shape/divisibility, re-run with an --img-size "
-            "that's a multiple of the value the error message reports.",
+            "RF-DETR export() failed at resolution=%d: %s\n"
+            "If this mentions shape/divisibility, note that --img-sizes entries "
+            "not divisible by 32 are already filtered out before export runs.",
+            img_size,
             e,
         )
         log.debug(traceback.format_exc())
@@ -468,6 +516,7 @@ def export_rfdetr_onnx(img_size: int, out_dir: Path, opset: int) -> Optional[Pat
 @dataclass
 class ModelResult:
     name: str
+    img_size: int = 0
     status: str = "not_run"  # not_run | ok | failed
     error: str = ""
     onnx_path: str = ""
@@ -517,6 +566,7 @@ class _RssSampler:
 
 
 def benchmark_onnx_model(
+    name: str,
     onnx_path: Path,
     preprocess_fn: Callable[[Path, int], "object"],
     image_paths: list[Path],
@@ -528,7 +578,7 @@ def benchmark_onnx_model(
     import numpy as np  # noqa: F401  (ensures numpy import errors surface here, not deep in preprocess)
     import psutil
 
-    result = ModelResult(name=onnx_path.stem, onnx_path=str(onnx_path))
+    result = ModelResult(name=name, img_size=img_size, onnx_path=str(onnx_path))
 
     try:
         result.file_size_mb = human_mb(onnx_path.stat().st_size)
@@ -631,10 +681,10 @@ def write_csv(results: list[ModelResult], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["model", "run_index", "latency_ms"])
+        w.writerow(["model", "img_size", "run_index", "latency_ms"])
         for r in results:
             for i, ms in enumerate(r.per_run_ms):
-                w.writerow([r.name, i, round(ms, 4)])
+                w.writerow([r.name, r.img_size, i, round(ms, 4)])
     log.info("Wrote per-run timings to %s", path)
 
 
@@ -646,9 +696,38 @@ def write_markdown(results: list[ModelResult], path: Path, meta: dict) -> None:
     for k, v in meta.items():
         lines.append(f"- **{k}**: {v}")
     lines.append("")
+
+    # Pivot table: FPS by resolution, one column per model. Quick way to read
+    # the speed/resolution tradeoff curve for each architecture at a glance.
+    model_names: list[str] = []
+    for r in results:
+        if r.name not in model_names:
+            model_names.append(r.name)
+    sizes_present = sorted({r.img_size for r in results})
+    by_key = {(r.name, r.img_size): r for r in results}
+
+    if len(sizes_present) > 1:
+        lines.append("## FPS by resolution\n")
+        header = ["Resolution"] + model_names
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("|" + "---|" * len(header))
+        for s in sizes_present:
+            row = [f"{s}x{s}"]
+            for m in model_names:
+                rr = by_key.get((m, s))
+                if rr is None:
+                    row.append("-")
+                elif rr.status != "ok":
+                    row.append("FAILED")
+                else:
+                    row.append(str(rr.fps))
+            lines.append("| " + " | ".join(row) + " |")
+        lines.append("")
+
     lines.append("## Results\n")
     header = [
         "Model",
+        "Resolution",
         "Status",
         "Avg latency (ms)",
         "Std (ms)",
@@ -661,15 +740,16 @@ def write_markdown(results: list[ModelResult], path: Path, meta: dict) -> None:
     ]
     lines.append("| " + " | ".join(header) + " |")
     lines.append("|" + "---|" * len(header))
-    for r in results:
+    for r in sorted(results, key=lambda r: (r.name, r.img_size)):
+        res = f"{r.img_size}x{r.img_size}"
         if r.status != "ok":
             lines.append(
-                f"| {r.name} | FAILED | - | - | - | - | - | - | "
+                f"| {r.name} | {res} | FAILED | - | - | - | - | - | - | "
                 f"{r.file_size_mb if r.file_size_mb is not None else '-'} | 0 |"
             )
             continue
         lines.append(
-            f"| {r.name} | ok | {r.avg_latency_ms} | {r.std_latency_ms} | "
+            f"| {r.name} | {res} | ok | {r.avg_latency_ms} | {r.std_latency_ms} | "
             f"{r.min_latency_ms} / {r.max_latency_ms} | {r.fps} | {r.peak_rss_mb} | "
             f"{r.cpu_percent} | {r.file_size_mb} | {r.num_timed_runs} |"
         )
@@ -678,8 +758,8 @@ def write_markdown(results: list[ModelResult], path: Path, meta: dict) -> None:
     failed = [r for r in results if r.status != "ok"]
     if failed:
         lines.append("## Errors\n")
-        for r in failed:
-            lines.append(f"- **{r.name}**: {r.error}")
+        for r in sorted(failed, key=lambda r: (r.name, r.img_size)):
+            lines.append(f"- **{r.name}** @ {r.img_size}x{r.img_size}: {r.error}")
         lines.append("")
 
     lines.append(
@@ -704,7 +784,16 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--img-size", type=int, default=640, help="Square input resolution (default: 640)")
+    p.add_argument(
+        "--img-sizes",
+        type=str,
+        default=DEFAULT_IMG_SIZES,
+        help=(
+            "Comma-separated square input resolutions to sweep, covering the full "
+            "practically-supported range (default: %(default)s). Both models "
+            "require multiples of 32; invalid entries are dropped with a warning."
+        ),
+    )
     p.add_argument("--images", type=Path, default=None, help="Directory of local test images")
     p.add_argument(
         "--num-fallback-images",
@@ -745,7 +834,10 @@ def parse_args() -> argparse.Namespace:
         "--onnx-dir",
         type=Path,
         default=None,
-        help="Directory with pre-exported yolox_*.onnx / rfdetr_*.onnx (used with --skip-export)",
+        help=(
+            "Directory with pre-exported onnx files, one subdirectory per "
+            "resolution (e.g. <dir>/640/yolox_nano.onnx); used with --skip-export"
+        ),
     )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
@@ -767,89 +859,134 @@ def main() -> int:
 
     log.info("Platform: %s | Python: %s | CPUs: %s", platform.platform(), platform.python_version(), os.cpu_count())
 
+    img_sizes = parse_img_sizes(args.img_sizes)
+    if not img_sizes:
+        log.error("No valid resolutions remain in --img-sizes %r; nothing to do.", args.img_sizes)
+        return 1
+    log.info("Resolution sweep: %s", ", ".join(f"{s}x{s}" for s in img_sizes))
+
     results: list[ModelResult] = []
-    yolox_onnx: Optional[Path] = None
-    rfdetr_onnx: Optional[Path] = None
+    # onnx_by_size[size] = {"yolox": Optional[Path], "rfdetr": Optional[Path]}
+    onnx_by_size: dict[int, dict[str, Optional[Path]]] = {}
 
-    # ---- resolve/export ONNX files -----------------------------------
-    if args.skip_export:
-        src = args.onnx_dir or onnx_dir
-        if not src.is_dir():
-            log.error("--skip-export given but --onnx-dir %s does not exist", src)
+    # ---- one-time YOLOX repo/checkpoint setup (resolution-independent) ----
+    yolox_repo_dir: Optional[Path] = None
+    yolox_ckpt_path: Optional[Path] = None
+    if not args.skip_export and not args.skip_yolox:
+        try:
+            yolox_repo_dir = setup_yolox_repo(work_dir)
+            if yolox_repo_dir is not None:
+                yolox_ckpt_path = work_dir / f"yolox_{args.yolox_variant}.pth"
+                if not yolox_ckpt_path.exists() and not download_file(
+                    YOLOX_CKPT_URLS[args.yolox_variant], yolox_ckpt_path
+                ):
+                    log.error(
+                        "Could not download YOLOX-%s checkpoint; YOLOX will be FAILED at every resolution.",
+                        args.yolox_variant,
+                    )
+                    yolox_ckpt_path = None
+        except Exception as e:
+            log.error("Unexpected error during YOLOX setup: %s", e)
+            log.debug(traceback.format_exc())
+
+    # ---- resolve/export ONNX files, per resolution -------------------
+    for size in img_sizes:
+        size_dir = onnx_dir / str(size)
+        yolox_onnx: Optional[Path] = None
+        rfdetr_onnx: Optional[Path] = None
+
+        if args.skip_export:
+            src = (args.onnx_dir or onnx_dir) / str(size)
+            if not src.is_dir():
+                log.warning("--skip-export: no onnx directory for resolution %dx%d (%s)", size, size, src)
+            else:
+                yx = list(src.glob(f"yolox_{args.yolox_variant}*.onnx"))
+                rf = list(src.glob("rfdetr*.onnx")) + list(src.glob("inference_model.onnx"))
+                yolox_onnx = yx[0] if yx else None
+                rfdetr_onnx = rf[0] if rf else None
+                if not args.skip_yolox and not yolox_onnx:
+                    log.warning("No matching yolox_%s*.onnx found in %s", args.yolox_variant, src)
+                if not args.skip_rfdetr and not rfdetr_onnx:
+                    log.warning("No matching rfdetr/inference_model.onnx found in %s", src)
         else:
-            yx = list(src.glob(f"yolox_{args.yolox_variant}*.onnx"))
-            rf = list(src.glob("rfdetr*.onnx")) + list(src.glob("inference_model.onnx"))
-            yolox_onnx = yx[0] if yx else None
-            rfdetr_onnx = rf[0] if rf else None
-            if not yolox_onnx:
-                log.warning("No matching yolox_%s*.onnx found in %s", args.yolox_variant, src)
-            if not rfdetr_onnx:
-                log.warning("No matching rfdetr/inference_model.onnx found in %s", src)
-    else:
-        if not args.skip_yolox:
-            log.info("=== Exporting YOLOX-%s ===", args.yolox_variant)
-            try:
-                repo_dir = setup_yolox_repo(work_dir)
-                if repo_dir is not None:
-                    ckpt_path = work_dir / f"yolox_{args.yolox_variant}.pth"
-                    if not ckpt_path.exists():
-                        if not download_file(YOLOX_CKPT_URLS[args.yolox_variant], ckpt_path):
-                            log.error("Could not download YOLOX-%s checkpoint; skipping YOLOX.", args.yolox_variant)
-                            ckpt_path = None
-                    if ckpt_path and ckpt_path.exists():
-                        onnx_dir.mkdir(parents=True, exist_ok=True)
-                        dest = onnx_dir / f"yolox_{args.yolox_variant}.onnx"
-                        if export_yolox_onnx(
-                            repo_dir, args.yolox_variant, args.img_size, ckpt_path, dest, args.opset
-                        ):
-                            yolox_onnx = dest
-                        else:
-                            log.error("YOLOX export failed; YOLOX will be marked FAILED in the report.")
-            except Exception as e:
-                log.error("Unexpected error during YOLOX setup/export: %s", e)
-                log.debug(traceback.format_exc())
+            if not args.skip_yolox and yolox_repo_dir is not None and yolox_ckpt_path is not None:
+                log.info("=== Exporting YOLOX-%s @ %dx%d ===", args.yolox_variant, size, size)
+                try:
+                    dest = size_dir / f"yolox_{args.yolox_variant}.onnx"
+                    if export_yolox_onnx(yolox_repo_dir, args.yolox_variant, size, yolox_ckpt_path, dest, args.opset):
+                        yolox_onnx = dest
+                    else:
+                        log.error(
+                            "YOLOX export failed at %dx%d; YOLOX will be FAILED at this resolution.", size, size
+                        )
+                except Exception as e:
+                    log.error("Unexpected error exporting YOLOX at %dx%d: %s", size, size, e)
+                    log.debug(traceback.format_exc())
 
-        if not args.skip_rfdetr:
-            log.info("=== Exporting RF-DETR Nano ===")
-            try:
-                rfdetr_onnx = export_rfdetr_onnx(args.img_size, onnx_dir, args.opset)
-            except Exception as e:
-                log.error("Unexpected error during RF-DETR export: %s", e)
-                log.debug(traceback.format_exc())
+            if not args.skip_rfdetr:
+                log.info("=== Exporting RF-DETR Nano @ %dx%d ===", size, size)
+                try:
+                    rfdetr_onnx = export_rfdetr_onnx(size, size_dir, args.opset)
+                except Exception as e:
+                    log.error("Unexpected error exporting RF-DETR at %dx%d: %s", size, size, e)
+                    log.debug(traceback.format_exc())
+
+        onnx_by_size[size] = {"yolox": yolox_onnx, "rfdetr": rfdetr_onnx}
 
     if args.export_only:
         log.info("--export-only set; exiting after export.")
-        log.info("YOLOX onnx: %s", yolox_onnx or "FAILED/SKIPPED")
-        log.info("RF-DETR onnx: %s", rfdetr_onnx or "FAILED/SKIPPED")
-        return 0 if (yolox_onnx or rfdetr_onnx) else 1
+        any_ok = False
+        for size in img_sizes:
+            d = onnx_by_size[size]
+            log.info(
+                "  %dx%d: yolox=%s rfdetr=%s",
+                size,
+                size,
+                d["yolox"] or "FAILED/SKIPPED",
+                d["rfdetr"] or "FAILED/SKIPPED",
+            )
+            any_ok = any_ok or bool(d["yolox"]) or bool(d["rfdetr"])
+        return 0 if any_ok else 1
 
-    # ---- test images ----------------------------------------------------
+    # ---- test images (resolution-independent) ----------------------------
     try:
         image_paths = get_test_images(args.images, args.num_fallback_images, work_dir)
     except Exception as e:
         log.error("Could not obtain any test images: %s", e)
         return 1
 
-    # ---- benchmark --------------------------------------------------
-    if not args.skip_yolox:
-        r = ModelResult(name=f"yolox_{args.yolox_variant}")
-        if yolox_onnx is None:
-            r.status, r.error = "failed", "export/skip-export did not produce an onnx file"
-        else:
-            r = benchmark_onnx_model(
-                yolox_onnx, preprocess_yolox, image_paths, args.img_size, args.warmup_runs, args.timed_runs, args.threads
-            )
-        results.append(r)
+    # ---- benchmark, per resolution ------------------------------------
+    for size in img_sizes:
+        d = onnx_by_size[size]
 
-    if not args.skip_rfdetr:
-        r = ModelResult(name="rfdetr_nano")
-        if rfdetr_onnx is None:
-            r.status, r.error = "failed", "export/skip-export did not produce an onnx file"
-        else:
-            r = benchmark_onnx_model(
-                rfdetr_onnx, preprocess_rfdetr, image_paths, args.img_size, args.warmup_runs, args.timed_runs, args.threads
-            )
-        results.append(r)
+        if not args.skip_yolox:
+            name = f"yolox_{args.yolox_variant}"
+            if d["yolox"] is None:
+                r = ModelResult(
+                    name=name,
+                    img_size=size,
+                    status="failed",
+                    error="export/skip-export did not produce an onnx file",
+                )
+            else:
+                r = benchmark_onnx_model(
+                    name, d["yolox"], preprocess_yolox, image_paths, size, args.warmup_runs, args.timed_runs, args.threads
+                )
+            results.append(r)
+
+        if not args.skip_rfdetr:
+            if d["rfdetr"] is None:
+                r = ModelResult(
+                    name="rfdetr_nano",
+                    img_size=size,
+                    status="failed",
+                    error="export/skip-export did not produce an onnx file",
+                )
+            else:
+                r = benchmark_onnx_model(
+                    "rfdetr_nano", d["rfdetr"], preprocess_rfdetr, image_paths, size, args.warmup_runs, args.timed_runs, args.threads
+                )
+            results.append(r)
 
     if not results:
         log.error("Both models skipped (--skip-yolox and --skip-rfdetr); nothing to do.")
@@ -860,7 +997,7 @@ def main() -> int:
         "platform": platform.platform(),
         "python_version": platform.python_version(),
         "cpu_count": os.cpu_count(),
-        "img_size": args.img_size,
+        "img_sizes": ", ".join(f"{s}x{s}" for s in img_sizes),
         "threads": args.threads,
         "warmup_runs": args.warmup_runs,
         "timed_runs": args.timed_runs,
