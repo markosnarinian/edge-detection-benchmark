@@ -368,7 +368,7 @@ def setup_yolox_repo(work_dir: Path) -> Optional[Path]:
 
 
 def export_yolox_onnx(
-    repo_dir: Path, variant: str, img_size: int, ckpt_path: Path, out_path: Path, opset: int
+    repo_dir: Path, variant: str, img_size: int, ckpt_path: Path, out_path: Path, opset: int, num_classes: int
 ) -> bool:
     try:
         sys.path.insert(0, str(repo_dir))
@@ -384,11 +384,29 @@ def export_yolox_onnx(
         # Override the experiment's default 416x416 test size so both models
         # are compared at the same resolution for each entry in --img-sizes.
         exp.test_size = (img_size, img_size)
+        # Override the pretrained checkpoint's 80-class (COCO) head shape with
+        # --num-classes. The backbone/neck stay pretrained; only the head's
+        # classification conv is shape-mismatched and gets randomly
+        # reinitialized below (fine for a latency-only benchmark).
+        exp.num_classes = num_classes
 
         model = exp.get_model()
         ckpt = torch.load(str(ckpt_path), map_location="cpu")
         state_dict = ckpt.get("model", ckpt)
-        model.load_state_dict(state_dict)
+        model_state = model.state_dict()
+        compatible_state = {
+            k: v for k, v in state_dict.items() if k in model_state and model_state[k].shape == v.shape
+        }
+        skipped = sorted(set(state_dict) - set(compatible_state))
+        if skipped:
+            log.warning(
+                "num_classes=%d differs from the checkpoint's trained class count; "
+                "%d head tensor(s) shape-mismatched and left randomly initialized: %s",
+                num_classes,
+                len(skipped),
+                skipped,
+            )
+        model.load_state_dict(compatible_state, strict=False)
         model.eval()
         # Fuse decode step into a plain conv graph rather than the training-time
         # decoding path, matching what YOLOX's own tools/export_onnx.py does by
@@ -436,7 +454,7 @@ def export_yolox_onnx(
 # --------------------------------------------------------------------------
 
 
-def export_rfdetr_onnx(img_size: int, out_dir: Path, opset: int) -> Optional[Path]:
+def export_rfdetr_onnx(img_size: int, out_dir: Path, opset: int, num_classes: int) -> Optional[Path]:
     if not pip_install(["-q", "rfdetr[onnx]"], timeout=1800):
         log.error(
             "Failed to install rfdetr[onnx]. Check internet connectivity and "
@@ -452,11 +470,14 @@ def export_rfdetr_onnx(img_size: int, out_dir: Path, opset: int) -> Optional[Pat
 
     try:
         log.info(
-            "Instantiating RFDETRNano() at resolution=%d — this auto-downloads "
-            "the official pretrained COCO checkpoint on first run.",
+            "Instantiating RFDETRNano() at resolution=%d, num_classes=%d — this "
+            "auto-downloads the official pretrained COCO checkpoint on first run "
+            "and re-initializes the detection head if num_classes differs from "
+            "the checkpoint's trained class count.",
             img_size,
+            num_classes,
         )
-        model = RFDETRNano(resolution=img_size)
+        model = RFDETRNano(resolution=img_size, num_classes=num_classes)
     except Exception as e:
         log.error(
             "RFDETRNano(resolution=%d) failed to construct: %s\n"
@@ -818,6 +839,19 @@ def parse_args() -> argparse.Namespace:
         help="onnxruntime intra_op_num_threads (default: all detected cores)",
     )
     p.add_argument("--opset", type=int, default=17, help="ONNX opset version for export (default: 17)")
+    p.add_argument(
+        "--num-classes",
+        type=int,
+        default=15,
+        help=(
+            "Detection head class count for both models (default: 15). Differs "
+            "from the pretrained COCO checkpoints (80/90 classes), so the "
+            "classification head is reinitialized to this shape at export time; "
+            "the pretrained backbone/neck weights are kept. This only matters "
+            "for a latency benchmark insofar as head size scales with class "
+            "count — detection *output* is meaningless either way."
+        ),
+    )
     p.add_argument("--work-dir", type=Path, default=Path("./work"), help="Scratch dir for repo clones/checkpoints")
     p.add_argument("--output-dir", type=Path, default=Path("./bench_output"), help="Where results are written")
     p.add_argument("--skip-yolox", action="store_true", help="Skip the YOLOX model entirely")
@@ -913,7 +947,9 @@ def main() -> int:
                 log.info("=== Exporting YOLOX-%s @ %dx%d ===", args.yolox_variant, size, size)
                 try:
                     dest = size_dir / f"yolox_{args.yolox_variant}.onnx"
-                    if export_yolox_onnx(yolox_repo_dir, args.yolox_variant, size, yolox_ckpt_path, dest, args.opset):
+                    if export_yolox_onnx(
+                        yolox_repo_dir, args.yolox_variant, size, yolox_ckpt_path, dest, args.opset, args.num_classes
+                    ):
                         yolox_onnx = dest
                     else:
                         log.error(
@@ -926,7 +962,7 @@ def main() -> int:
             if not args.skip_rfdetr:
                 log.info("=== Exporting RF-DETR Nano @ %dx%d ===", size, size)
                 try:
-                    rfdetr_onnx = export_rfdetr_onnx(size, size_dir, args.opset)
+                    rfdetr_onnx = export_rfdetr_onnx(size, size_dir, args.opset, args.num_classes)
                 except Exception as e:
                     log.error("Unexpected error exporting RF-DETR at %dx%d: %s", size, size, e)
                     log.debug(traceback.format_exc())
@@ -998,6 +1034,7 @@ def main() -> int:
         "python_version": platform.python_version(),
         "cpu_count": os.cpu_count(),
         "img_sizes": ", ".join(f"{s}x{s}" for s in img_sizes),
+        "num_classes": args.num_classes,
         "threads": args.threads,
         "warmup_runs": args.warmup_runs,
         "timed_runs": args.timed_runs,

@@ -137,6 +137,12 @@ python3 benchmark.py --skip-export --onnx-dir ./onnx --images ./my_test_images -
   num_windows(2) = 32`) — any entry that isn't gets dropped with a warning
   rather than aborting the whole run. Pass a custom comma-separated list to
   narrow the sweep, e.g. `--img-sizes 320,640,960`.
+- **`--num-classes`**: defaults to `15` (both models ship pretrained on COCO's
+  80/90 classes). The detection head's classification conv is reinitialized
+  to this shape at export time — the pretrained backbone/neck weights are
+  kept, only the head is affected — so this changes head compute cost without
+  needing a custom-trained checkpoint. Detection *output* is meaningless with
+  a randomly-initialized head either way; this is a latency-only benchmark.
 
 ## 5. Expected runtime (Pi 4, Path A, from a clean venv)
 
