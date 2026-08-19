@@ -8,7 +8,7 @@ Target hardware: Raspberry Pi 4 or Pi 5 (CPU-only, no accelerator).
 See README.md for the two-stage setup, dependency caveats, and Pi guidance.
 
 This script is meant to run unattended on a Raspberry Pi with nobody available
-to debug it interactively. Every external operation (pip install, git clone,
+to debug it interactively. Every external operation (uv install, git clone,
 checkpoint download, ONNX export, inference) is wrapped so a single failure is
 logged clearly and skipped rather than crashing the whole run. Partial results
 (e.g. only YOLOX succeeded, or only some resolutions) are still written out.
@@ -154,7 +154,7 @@ def run_cmd(
 
     ok = proc.returncode == 0
     if not ok:
-        # Keep the tail of the log; full pip/build output can be huge.
+        # Keep the tail of the log; full install/build output can be huge.
         tail = "\n".join(proc.stdout.splitlines()[-60:]) if proc.stdout else ""
         log.error(
             "command failed (exit %s): %s\n--- last output lines ---\n%s",
@@ -165,8 +165,11 @@ def run_cmd(
     return ok, proc.stdout or ""
 
 
-def pip_install(args: list[str], timeout: int = 1800) -> bool:
-    ok, _ = run_cmd([sys.executable, "-m", "pip", "install"] + args, timeout=timeout)
+def uv_install(args: list[str], timeout: int = 1800) -> bool:
+    ok, _ = run_cmd(
+        ["uv", "pip", "install", "--python", sys.executable] + args,
+        timeout=timeout,
+    )
     return ok
 
 
@@ -486,16 +489,16 @@ def setup_yolox_repo(work_dir: Path) -> Optional[Path]:
         "Pi 4 — see README.md for timing guidance and how to avoid it via "
         "--export-only on a faster machine."
     )
-    if not pip_install(["-q", "-r", str(repo_dir / "requirements.txt")], timeout=3600):
+    if not uv_install(["-q", "-r", str(repo_dir / "requirements.txt")], timeout=3600):
         log.error(
             "Failed to install YOLOX requirements.txt. This most commonly means "
             "torch failed to install. On a Pi, prefer the official PyTorch CPU "
-            "wheels: pip install torch --index-url https://download.pytorch.org/whl/cpu "
+            "wheels: uv pip install torch --default-index https://download.pytorch.org/whl/cpu "
             "(see README.md)."
         )
         return None
-    if not pip_install(["-q", "-e", str(repo_dir)], timeout=1200):
-        log.error("Failed to `pip install -e` the YOLOX repo itself.")
+    if not uv_install(["-q", "-e", str(repo_dir)], timeout=1200):
+        log.error("Failed to install the YOLOX repo itself.")
         return None
     return repo_dir
 
@@ -1424,7 +1427,7 @@ def main() -> int:
             log.debug(traceback.format_exc())
 
     if active_yolox_variants and "ncnn" in job_runtimes and not args.skip_export:
-        if not pip_install(["-q", "ncnn", "pnnx"], timeout=1800):
+        if not uv_install(["-q", "ncnn", "pnnx"], timeout=1800):
             log.error("Failed to install ncnn/pnnx; YOLOX ncnn cells may fail.")
 
     if active_rfdetr_variants and (not args.skip_export or "pytorch" in job_runtimes):
@@ -1437,7 +1440,7 @@ def main() -> int:
             if "executorch" in job_runtimes:
                 extras.append("executorch")
         package = f"rfdetr[{','.join(extras)}]" if extras else "rfdetr"
-        if not pip_install(["-q", package], timeout=3600):
+        if not uv_install(["-q", package], timeout=3600):
             log.error("Failed to install %s; RF-DETR cells may fail.", package)
 
     # Resolve/export every artifact required by the canonical job list. ONNX is

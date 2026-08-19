@@ -1,0 +1,30 @@
+[project]
+name = "edge-detection-benchmark"
+version = "0.1.0"
+description = "RF-DETR and YOLOX CPU benchmark for Raspberry Pi"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = []
+
+[dependency-groups]
+export = [
+    "ncnn",
+    "numpy",
+    "onnx",
+    "onnxsim",
+    "pillow",
+    "pnnx",
+    "psutil",
+]
+run = [
+    "ncnn",
+    "numpy",
+    "onnxruntime",
+    "openvino",
+    "pillow",
+    "psutil",
+]
+all = [
+    { include-group = "export" },
+    { include-group = "run" },
+]

@@ -111,6 +111,10 @@ def python_in_venv(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
+def uv_install_command(python: Path, *packages: str) -> list[str]:
+    return ["uv", "pip", "install", "--python", str(python), *packages]
+
+
 def prepare_environment(
     wizard: Wizard,
     *,
@@ -132,15 +136,11 @@ def prepare_environment(
         except (OSError, json.JSONDecodeError):
             pass
     if not python.exists() and not wizard.run(
-        [base_python, "-m", "venv", str(venv)], cwd=repository_root()
-    ):
-        return None
-    if not wizard.run(
-        [str(python), "-m", "pip", "install", "--upgrade", "pip"], cwd=repository_root()
+        ["uv", "venv", "--python", base_python, str(venv)], cwd=repository_root()
     ):
         return None
     if packages and not wizard.run(
-        [str(python), "-m", "pip", "install", *packages], cwd=repository_root()
+        uv_install_command(python, *packages), cwd=repository_root()
     ):
         return None
     if not wizard.dry_run:
@@ -456,7 +456,7 @@ def install_pi_dependencies(
     wizard: Wizard, python: Path, runtimes: list[str], root: Path
 ) -> bool:
     commands: list[list[str]] = [
-        [str(python), "-m", "pip", "install", *COMMON_PACKAGES]
+        uv_install_command(python, *COMMON_PACKAGES)
     ]
     packages = {
         "pytorch": ["torch", "torchvision"],
@@ -467,9 +467,9 @@ def install_pi_dependencies(
         "executorch": ["executorch"],
     }
     for runtime in runtimes:
-        command = [str(python), "-m", "pip", "install", *packages[runtime]]
+        command = uv_install_command(python, *packages[runtime])
         if runtime == "pytorch":
-            command.extend(("--index-url", "https://download.pytorch.org/whl/cpu"))
+            command.extend(("--default-index", "https://download.pytorch.org/whl/cpu"))
         commands.append(command)
     all_ok = True
     for command in commands:
@@ -483,7 +483,7 @@ def install_pi_dependencies(
                 "Try the tflite-runtime fallback?"
             ):
                 command_ok = wizard.run(
-                    [str(python), "-m", "pip", "install", "tflite-runtime"], cwd=root
+                    uv_install_command(python, "tflite-runtime"), cwd=root
                 )
             if not command_ok and not wizard.confirm("Continue setup?"):
                 return False

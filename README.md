@@ -32,13 +32,27 @@ and recreates the same matrix on the Pi.
 
 ## Prerequisites and dependency constraints
 
-Both machines need a clone of this repository, Python, Git, internet access,
-and enough free storage. The Pi should run 64-bit Raspberry Pi OS. At least 4 GB
-RAM, active cooling, and swap for the largest cells are recommended.
+Both machines need a clone of this repository, Python, Git, [uv](https://docs.astral.sh/uv/),
+internet access, and enough free storage. The Pi should run 64-bit Raspberry Pi
+OS. At least 4 GB RAM, active cooling, and swap for the largest cells are
+recommended.
 
 Getting compatible packages is part of the benchmark. The wizard creates
-virtual environments and runs `pip`, but it cannot create an ARM64 wheel that a
+virtual environments and installs packages with `uv`, but it cannot create an ARM64 wheel that a
 project does not publish or make incompatible package versions coexist.
+
+The dependency groups in `pyproject.toml` cover the stable stage prerequisites:
+
+```bash
+uv sync --group export  # artifact export dependencies
+uv sync --group run     # Raspberry Pi runtime dependencies
+uv sync --group all     # both stages in one environment
+```
+
+The wizard installs only the selected packages into its isolated environments,
+so running these commands first is optional. PyTorch, TFLite, ExecuTorch, and
+the model packages remain selection-specific because their available wheels and
+compatible versions vary by machine.
 
 - Use Python 3.10–3.12 generally.
 - RF-DETR TFLite export currently requires Python 3.12 and `rfdetr[tflite]`.
@@ -64,7 +78,7 @@ tens of gigabytes; put the artifact directory on spacious storage.
 Run from this repository on the export machine:
 
 ```bash
-python3 wizard.py export
+uv run python wizard.py export
 ```
 
 The wizard asks for models, runtimes, resolutions, class count, and ONNX opset.
@@ -82,7 +96,7 @@ artifacts are reused, and export continues with missing cells.
 Preview all setup and export commands without executing them:
 
 ```bash
-python3 wizard.py export --dry-run
+uv run python wizard.py export --dry-run
 ```
 
 ### Transfer the artifacts
@@ -109,7 +123,7 @@ hash-mismatched artifacts by default.
 From this repository on the Pi:
 
 ```bash
-python3 wizard.py pi
+uv run python wizard.py pi
 ```
 
 Enter the transferred artifact directory. The wizard:
@@ -123,13 +137,13 @@ Enter the transferred artifact directory. The wizard:
 You can provide the plan directly:
 
 ```bash
-python3 wizard.py pi --plan ./artifacts/benchmark-plan.json
+uv run python wizard.py pi --plan ./artifacts/benchmark-plan.json
 ```
 
 Preview the Pi setup and benchmark command without executing it:
 
 ```bash
-python3 wizard.py pi \
+uv run python wizard.py pi \
   --plan ./artifacts/benchmark-plan.json \
   --dry-run
 ```
@@ -145,14 +159,12 @@ The wizard is preferred, but the equivalent commands are useful for debugging.
 ### Export stable artifacts
 
 ```bash
-python3 -m venv export-stable
-source export-stable/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install torch torchvision \
-  --index-url https://download.pytorch.org/whl/cpu
-python3 -m pip install onnx onnxsim ncnn pnnx psutil pillow numpy
+uv venv --python 3.12 export-stable
+uv pip install --python export-stable/bin/python --group export
+uv pip install --python export-stable/bin/python torch torchvision \
+  --default-index https://download.pytorch.org/whl/cpu
 
-python3 benchmark.py \
+export-stable/bin/python benchmark.py \
   --export-only \
   --runtimes onnxruntime,openvino,ncnn \
   --artifact-dir ./results/artifacts
@@ -163,21 +175,15 @@ same artifact root:
 
 ```bash
 # TFLite: Python 3.12 environment
-deactivate
-python3.12 -m venv export-tflite
-source export-tflite/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install numpy pillow psutil
-python3 benchmark.py --export-only --skip-yolox \
+uv venv --python 3.12 export-tflite
+uv pip install --python export-tflite/bin/python numpy pillow psutil
+export-tflite/bin/python benchmark.py --export-only --skip-yolox \
   --runtimes tflite --artifact-dir ./results/artifacts
 
 # ExecuTorch: separate ABI-compatible environment
-deactivate
-python3 -m venv export-executorch
-source export-executorch/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install numpy pillow psutil
-python3 benchmark.py --export-only --skip-yolox \
+uv venv --python 3.12 export-executorch
+uv pip install --python export-executorch/bin/python numpy pillow psutil
+export-executorch/bin/python benchmark.py --export-only --skip-yolox \
   --runtimes executorch --artifact-dir ./results/artifacts
 ```
 
@@ -188,12 +194,10 @@ artifacts completed by another group.
 ### Run pre-exported stable artifacts on the Pi
 
 ```bash
-python3 -m venv pi-benchmark
-source pi-benchmark/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install onnxruntime openvino ncnn psutil pillow numpy
+uv venv --python 3.12 pi-benchmark
+uv pip install --python pi-benchmark/bin/python --group run
 
-python3 benchmark.py \
+pi-benchmark/bin/python benchmark.py \
   --skip-export \
   --artifact-dir ./artifacts \
   --runtimes onnxruntime,openvino,ncnn
@@ -207,13 +211,13 @@ the benchmark then prepares YOLOX/RF-DETR and their checkpoints on the Pi.
 
 ```bash
 # Add only the optional runtimes selected for this Pi environment.
-python3 -m pip install ai-edge-litert       # or: tflite-runtime
-python3 -m pip install executorch
-python3 -m pip install torch torchvision \
-  --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python pi-benchmark/bin/python ai-edge-litert  # or: tflite-runtime
+uv pip install --python pi-benchmark/bin/python executorch
+uv pip install --python pi-benchmark/bin/python torch torchvision \
+  --default-index https://download.pytorch.org/whl/cpu
 ```
 
-Run `python3 benchmark.py --help` for every model, runtime, resolution, output,
+Run `uv run python benchmark.py --help` for every model, runtime, resolution, output,
 thread, and resume option.
 
 ## Default matrix and practical subsets
@@ -232,7 +236,7 @@ Every resolution is divisible by 32, as required by both graph families. The
 full matrix may take many hours or days on a Pi 4. Start with a smaller sweep:
 
 ```bash
-python3 benchmark.py \
+uv run python benchmark.py \
   --yolox-variants nano,tiny,s \
   --rfdetr-variants nano,small \
   --runtimes onnxruntime \
