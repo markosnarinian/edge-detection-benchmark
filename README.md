@@ -29,6 +29,32 @@ Requirements:
 - Python 3.10–3.12, Git, internet access, and substantial free disk space
 - Python 3.12 on the export machine when TFLite is selected
 
+### Dependency and environment caveats
+
+Getting a compatible environment is part of running this benchmark. The wizard
+creates virtual environments and runs the required `pip` commands, but it cannot
+make an unavailable ARM64 wheel or an incompatible package combination work.
+In particular:
+
+- Stable ONNX/ncnn export, RF-DETR TFLite export, and RF-DETR ExecuTorch export
+  use separate virtual environments because their dependency constraints may
+  conflict.
+- TFLite export currently requires Python 3.12 and `rfdetr[tflite]`.
+- ExecuTorch requires mutually compatible PyTorch, ExecuTorch, and RF-DETR
+  builds. A `.pte` file exported with one ABI may not load with another.
+- OpenVINO ARM64 wheel support depends on the OpenVINO release, Raspberry Pi OS,
+  and Python version. Not every combination is published.
+- ncnn export needs both `pnnx` and `ncnn` on the export machine; the Pi needs
+  a compatible ncnn Python runtime.
+- Native PyTorch cells still need the YOLOX/RF-DETR source packages and model
+  checkpoints on the Pi; they are not contained in the static artifact bundle.
+
+Package installation failures are reported by the wizard, and unavailable
+runtimes remain visible as failed benchmark cells. Start with PyTorch, ONNX
+Runtime, OpenVINO, and ncnn where applicable, verify that matrix, then add the
+experimental TFLite and ExecuTorch groups. See [`SETUP.md`](SETUP.md) for the
+manual installation commands and platform-specific guidance.
+
 Static graphs repeat model weights at every resolution. A full export can use
 tens of gigabytes, so choose an artifact location with enough free space.
 
