@@ -21,6 +21,18 @@ Results are written as an HTML report to `results/index.html`, with JSON, raw
 CSV timings, resumable checkpoints, and reusable runtime artifacts alongside it.
 The generated `results/` directory is intentionally ignored by Git.
 
+For a guided two-machine workflow, run:
+
+```bash
+python3 wizard.py
+```
+
+Choose **export** on the faster machine. The wizard creates isolated export
+environments, records the chosen matrix in `benchmark-plan.json`, and tells you
+which artifact directory to copy. After copying that entire directory, run the
+wizard again on the Pi and choose **pi** to install runtimes and start or resume
+the benchmark.
+
 See [`SETUP.md`](SETUP.md) for installation, the complete test matrix,
 resumability behavior, and recommended staged runs. Hardware context for
 interpreting Pi 4/Pi 5 differences is in

@@ -78,6 +78,25 @@ a compatible faster machine is strongly recommended.
 
 ## Export elsewhere, benchmark on the Pi
 
+The interactive wizard is the easiest way to keep both machines on the same
+matrix and isolate version-sensitive exporters:
+
+```bash
+# On the export machine
+python3 wizard.py export
+
+# Copy the artifact directory it prints, then on the Pi
+python3 wizard.py pi
+```
+
+The export directory contains `benchmark-plan.json`. Transfer the whole
+directory, including that file and all `.export.json` hash manifests. The Pi
+stage reads the plan, creates an isolated environment, offers to install the
+selected runtime packages, then launches the crash-resumable benchmark. Use
+`python3 wizard.py --help` for dry-run and non-interactive options.
+
+The equivalent manual process follows.
+
 On the export machine:
 
 ```bash
