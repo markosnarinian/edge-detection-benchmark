@@ -1,22 +1,26 @@
-# RF-DETR Nano vs YOLOX: CPU-only edge detector benchmark
+# RF-DETR vs YOLOX: CPU edge-detector benchmark
 
-Evaluating a YOLOX replacement (unmaintained since 2022) for CPU-only object
-detection on a Raspberry Pi. Production target is a Pi 5; only a Pi 4 is
-available for benchmarking right now.
+`benchmark.py` compares all core RF-DETR detection variants (Nano, Small,
+Medium, Large) with all seven official YOLOX variants (Nano, Tiny, S, M, L, X,
+Darknet53). Every model is measured with the CPU/Linux runtimes both families
+officially support from Python: native PyTorch, ONNX Runtime, and OpenVINO.
 
-## Files
+The default sweep covers 14 practical square resolutions from 256 to 1024.
+Use the variant, runtime, and resolution flags to run a smaller matrix first:
 
-- **[`pi4_vs_pi5_notes.md`](pi4_vs_pi5_notes.md)** — hardware research: what
-  actually differs between Pi 4 (Cortex-A72) and Pi 5 (Cortex-A76) at the
-  microarchitecture/memory level, and why RF-DETR (transformer-heavy) and
-  YOLOX (conv-heavy) are not expected to scale by the same multiplier between
-  the two boards.
-- **[`benchmark.py`](benchmark.py)** — the benchmark script. Exports official
-  pretrained RF-DETR Nano and YOLOX-Nano/Tiny checkpoints to ONNX and measures
-  CPU-only ONNX Runtime latency/FPS/memory/CPU%/file size on a fixed set of
-  test images, swept across multiple input resolutions in one run
-  (`--img-sizes`, default `320,416,512,640,768,896,1024` — the full
-  practically-supported range, since both architectures require resolutions
-  divisible by 32). **Not yet run** — this needs to execute on the actual Pi 4.
-- **[`SETUP.md`](SETUP.md)** — exact install commands, Pi-specific caveats,
-  expected runtime, and how to interpret `benchmark.py`'s output files.
+```bash
+python3 benchmark.py \
+  --yolox-variants nano,tiny \
+  --rfdetr-variants nano,small \
+  --runtimes onnxruntime \
+  --img-sizes 320,416,512,640
+```
+
+Results are written as an HTML report to `results/index.html`, with JSON, raw
+CSV timings, resumable checkpoints, and reusable ONNX exports alongside it.
+The generated `results/` directory is intentionally ignored by Git.
+
+See [`SETUP.md`](SETUP.md) for installation, the complete test matrix,
+resumability behavior, and recommended staged runs. Hardware context for
+interpreting Pi 4/Pi 5 differences is in
+[`pi4_vs_pi5_notes.md`](pi4_vs_pi5_notes.md).
