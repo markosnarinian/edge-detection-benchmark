@@ -71,8 +71,10 @@ python3 -m pip install ncnn pnnx
 The script installs the required RF-DETR extras and cloned YOLOX package when
 export or native PyTorch is requested. TFLite export currently needs Python
 3.12 and `rfdetr[tflite]`; ExecuTorch needs a Torch/ExecuTorch ABI-compatible
-`rfdetr[executorch]` environment. Exporting artifacts on a compatible faster
-machine is strongly recommended.
+`rfdetr[executorch]` environment. Those dependency sets may conflict, so it can
+be necessary to export TFLite and ExecuTorch in separate virtual environments
+and copy both verified artifact directories to the Pi. Exporting artifacts on
+a compatible faster machine is strongly recommended.
 
 ## Export elsewhere, benchmark on the Pi
 
@@ -105,11 +107,14 @@ The benchmark applies the useful low-complexity resilience measures:
 
 1. Downloads use a `.partial` file, `fsync`, and atomic rename. Interrupted
    downloads are never mistaken for valid checkpoints.
-2. Runtime exports are written to a temporary file/directory and atomically
-   moved into place only after a non-empty artifact exists.
-3. Existing non-empty runtime artifacts are reused, so export resumes at the
-   first missing model/resolution. A sidecar signature prevents reuse after
-   changing the class count or ONNX opset.
+2. Runtime exports are written to a temporary file/directory. A SHA-256
+   manifest is written atomically only after every component is present; for
+   ncnn, the manifest commits the `.param` and `.bin` as one verified pair.
+3. Existing runtime artifacts are reused only after their configuration,
+   component sizes, and SHA-256 hashes validate. Manifests also record exporter
+   versions. This applies to `--skip-export`; use `--allow-unsigned-artifacts`
+   only to import legacy artifacts deliberately. Their current content is still
+   hashed into the resume identity.
 4. `results/checkpoint.json` is atomically replaced after every completed
    model/runtime/resolution cell. A rerun with the same matrix skips completed
    cells, including recorded failures. Use `--no-resume` after fixing a failed
@@ -126,10 +131,12 @@ model reload overhead to a latency benchmark. It is not justified unless real
 Pi runs show repeated native crashes. No software measure protects against
 filesystem/media corruption; copy `results/` off-device for long runs.
 
-Resume matching includes models, runtimes, resolutions, class count, thread
-count, run counts, and image source. A changed configuration starts a new run
-instead of mixing incomparable measurements. Because the same directory holds
-one checkpoint, use a separate `--output-dir` for matrices you want to retain.
+Resume matching includes the exact supported job list, class count, ONNX opset,
+thread and run counts, image source, source/runtime/exporter versions, and every
+artifact content identity. Replacing a graph or runtime therefore starts a new
+run instead of mixing incompatible measurements. Because the same directory
+holds one checkpoint, use a separate `--output-dir` for matrices you want to
+retain.
 
 ## Output
 
@@ -139,8 +146,9 @@ The default ignored `results/` directory contains:
 - `results.json` — machine-readable summary and metadata
 - `per_run_timings.csv` — every timed inference
 - `checkpoint.json` — durable resume state
-- `artifacts/<model>/<resolution>/<runtime>/` — reusable ONNX, ncnn,
-  TFLite, and ExecuTorch static-shape exports with configuration sidecars
+- `artifacts/<model>/<resolution>/onnx/` — ONNX shared by ONNX Runtime/OpenVINO
+- `artifacts/<model>/<resolution>/{ncnn,tflite,executorch}/` — native static
+  graphs for the applicable model, with hash manifests beside every artifact
 
 Failed cells remain visible with their error instead of aborting the matrix.
 The command exits successfully when at least one cell succeeds.
@@ -149,7 +157,10 @@ The command exits successfully when at least one cell succeeds.
 
 - Use active cooling and check for thermal throttling during long sweeps.
 - Close unrelated processes and use the same runtime versions across devices.
-- `--threads` defaults to all detected cores and is applied to each runtime.
+- `--threads` defaults to all detected cores and is applied to PyTorch, ONNX
+  Runtime, OpenVINO, ncnn, and TFLite. ExecuTorch/XNNPACK currently has no
+  stable per-program Python thread-setting API, so its report rows explicitly
+  show `runtime-default` rather than claiming controlled thread parity.
 - CPU percentage is process-wide and may approach 400% on a four-core Pi.
 - The default 15-class head is reinitialized from COCO checkpoints. This keeps
   head compute representative of the intended deployment, but predictions are

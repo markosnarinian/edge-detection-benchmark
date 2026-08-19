@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import html
+import importlib.metadata
 import json
 import logging
 import os
@@ -195,6 +197,111 @@ def download_file(url: str, dest: Path, timeout: int = 60, retries: int = 2) -> 
 
 def human_mb(num_bytes: float) -> float:
     return round(num_bytes / (1024 * 1024), 2)
+
+
+def package_version(*distributions: str) -> str:
+    """Return the first installed distribution version without importing it."""
+    for distribution in distributions:
+        try:
+            return importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return "unavailable"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def artifact_components(path: Path, kind: str) -> list[Path]:
+    return [path, path.with_suffix(".bin")] if kind == "ncnn" else [path]
+
+
+def exporter_versions(family: str, kind: str) -> dict[str, str]:
+    distributions = {
+        ("yolox", "onnx"): ("torch", "onnx", "onnxsim"),
+        ("yolox", "ncnn"): ("torch", "pnnx", "ncnn"),
+        ("rfdetr", "onnx"): ("rfdetr", "torch", "onnx"),
+        ("rfdetr", "tflite"): ("rfdetr", "torch", "ai-edge-litert", "tensorflow"),
+        ("rfdetr", "executorch"): ("rfdetr", "torch", "executorch"),
+    }[(family, kind)]
+    return {name: package_version(name) for name in distributions}
+
+
+def runtime_versions(runtimes: list[str]) -> dict[str, str]:
+    distributions = {
+        "pytorch": ("torch",),
+        "onnxruntime": ("onnxruntime",),
+        "openvino": ("openvino",),
+        "ncnn": ("ncnn",),
+        "tflite": ("ai-edge-litert", "tflite-runtime", "tensorflow"),
+        "executorch": ("executorch",),
+    }
+    return {runtime: package_version(*distributions[runtime]) for runtime in runtimes}
+
+
+def build_artifact_manifest(path: Path, kind: str, config: dict, versions: dict[str, str]) -> dict:
+    components = {
+        component.name: {"sha256": sha256_file(component), "size": component.stat().st_size}
+        for component in artifact_components(path, kind)
+    }
+    identity_source = json.dumps(
+        {"config": config, "exporter_versions": versions, "components": components},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return {
+        "schema": 2,
+        "config": config,
+        "exporter_versions": versions,
+        "components": components,
+        "artifact_id": hashlib.sha256(identity_source).hexdigest(),
+    }
+
+
+def validate_artifact_manifest(
+    path: Path,
+    kind: str,
+    manifest_path: Path,
+    config: dict,
+    expected_versions: Optional[dict[str, str]] = None,
+) -> tuple[bool, Optional[dict], str]:
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("schema") != 2 or manifest.get("config") != config:
+            return False, None, "manifest configuration does not match"
+        if expected_versions is not None and manifest.get("exporter_versions") != expected_versions:
+            return False, None, "exporter versions do not match"
+        recorded = manifest.get("components")
+        components = artifact_components(path, kind)
+        if not isinstance(recorded, dict) or set(recorded) != {item.name for item in components}:
+            return False, None, "manifest component list does not match"
+        for component in components:
+            details = recorded[component.name]
+            if not isinstance(details, dict):
+                return False, None, f"invalid manifest entry for {component.name}"
+            if not component.is_file() or component.stat().st_size != details.get("size"):
+                return False, None, f"missing or size-mismatched component {component.name}"
+            if sha256_file(component) != details.get("sha256"):
+                return False, None, f"hash mismatch for {component.name}"
+        identity_source = json.dumps(
+            {
+                "config": manifest["config"],
+                "exporter_versions": manifest["exporter_versions"],
+                "components": recorded,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        if hashlib.sha256(identity_source).hexdigest() != manifest.get("artifact_id"):
+            return False, None, "artifact identity does not match"
+        return True, manifest, ""
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
+        return False, None, str(e)
 
 
 DEFAULT_IMG_SIZES = "256,320,384,416,448,512,576,640,704,768,832,896,960,1024"
@@ -422,6 +529,93 @@ def load_yolox_model(
     return model
 
 
+def replace_yolox_focus_for_export(model) -> int:
+    """Replace pnnx-incompatible Focus slicing while preserving exact outputs."""
+    import torch  # type: ignore
+    from yolox.models.network_blocks import Focus  # type: ignore
+
+    class ExportFocus(torch.nn.Module):
+        def __init__(self, focus):
+            super().__init__()
+            self.unshuffle = torch.nn.PixelUnshuffle(2)
+            self.conv = focus.conv
+            weight = self.conv.conv.weight
+            channels = weight.shape[1] // 4
+            indices = torch.arange(channels, device=weight.device)
+            # Focus emits TL/BL/TR/BR channel blocks. PixelUnshuffle emits
+            # TL/TR/BL/BR per source channel, so adapt the consumer weights.
+            permutation = torch.stack(
+                (indices, indices + 2 * channels, indices + channels, indices + 3 * channels),
+                dim=1,
+            ).reshape(-1)
+            with torch.no_grad():
+                self.conv.conv.weight.copy_(weight[:, permutation].contiguous())
+
+        def forward(self, value):
+            return self.conv(self.unshuffle(value))
+
+    replacements = 0
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, Focus):
+            continue
+        parent_name, _, child_name = module_name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        setattr(parent, child_name, ExportFocus(module))
+        replacements += 1
+    return replacements
+
+
+def flatten_torch_outputs(value):
+    import torch  # type: ignore
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy().reshape(-1)
+    if isinstance(value, dict):
+        values = [flatten_torch_outputs(value[key]) for key in sorted(value)]
+    elif isinstance(value, (tuple, list)):
+        values = [flatten_torch_outputs(item) for item in value]
+    else:
+        raise TypeError(f"unsupported model output type: {type(value).__name__}")
+    import numpy as np
+
+    return np.concatenate(values)
+
+
+def validate_ncnn_export(param_path: Path, bin_path: Path, input_array, expected_output) -> None:
+    """Load with stock ncnn and reject a converted graph whose raw output drifts."""
+    import ncnn  # type: ignore
+    import numpy as np
+
+    net = ncnn.Net()
+    net.opt.use_vulkan_compute = False
+    net.opt.use_fp16_storage = False
+    net.opt.use_fp16_arithmetic = False
+    if net.load_param(str(param_path)) != 0 or net.load_model(str(bin_path)) != 0:
+        raise RuntimeError("stock ncnn failed to load the converted param/bin pair")
+    input_names = list(net.input_names())
+    output_names = list(net.output_names())
+    if len(input_names) != 1 or not output_names:
+        raise RuntimeError(f"unexpected ncnn I/O names: {input_names}/{output_names}")
+    input_mat = ncnn.Mat(input_array[0]).clone()
+    extractor = net.create_extractor()
+    code = extractor.input(input_names[0], input_mat)
+    if code != 0:
+        raise RuntimeError(f"ncnn input binding failed: {code}")
+    actual_parts = []
+    for output_name in output_names:
+        code, output = extractor.extract(output_name)
+        if code != 0:
+            raise RuntimeError(f"ncnn extraction failed for {output_name}: {code}")
+        actual_parts.append(np.asarray(output).reshape(-1))
+    actual = np.concatenate(actual_parts)
+    expected = flatten_torch_outputs(expected_output)
+    if actual.shape != expected.shape:
+        raise RuntimeError(f"ncnn parity shape mismatch: {actual.shape} != {expected.shape}")
+    if not np.allclose(actual, expected, rtol=2e-3, atol=2e-3):
+        max_error = float(np.max(np.abs(actual - expected)))
+        raise RuntimeError(f"ncnn raw-output parity check failed (max abs error {max_error:.6g})")
+
+
 def export_yolox_onnx(
     repo_dir: Path, variant: str, img_size: int, ckpt_path: Path, out_path: Path, opset: int, num_classes: int
 ) -> bool:
@@ -491,13 +685,29 @@ def export_yolox_ncnn(
         import torch  # type: ignore
 
         model = load_yolox_model(repo_dir, variant, img_size, ckpt_path, num_classes)
-        dummy = torch.randn(1, 3, img_size, img_size)
+        dummy = torch.linspace(-1.0, 1.0, steps=3 * img_size * img_size).reshape(
+            1, 3, img_size, img_size
+        )
+        with torch.inference_mode():
+            original_output = model(dummy)
+        replacements = replace_yolox_focus_for_export(model)
+        with torch.inference_mode():
+            transformed_output = model(dummy)
+        if not torch.allclose(
+            torch.from_numpy(flatten_torch_outputs(original_output)),
+            torch.from_numpy(flatten_torch_outputs(transformed_output)),
+            rtol=1e-5,
+            atol=1e-5,
+        ):
+            raise RuntimeError("PixelUnshuffle Focus replacement changed PyTorch output")
+        log.info("Replaced %d YOLOX Focus module(s) for pnnx export", replacements)
         torchscript_path = partial_dir / "model.pt"
         pnnx.export(model, str(torchscript_path), (dummy,), fp16=False)
         params = list(partial_dir.glob("*.ncnn.param")) + list(partial_dir.glob("*.param"))
         bins = list(partial_dir.glob("*.ncnn.bin")) + list(partial_dir.glob("*.bin"))
         if not params or not bins:
             raise RuntimeError("pnnx completed without producing ncnn .param/.bin files")
+        validate_ncnn_export(params[0], bins[0], dummy.numpy(), transformed_output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         bin_path = out_path.with_suffix(".bin")
         bins[0].replace(bin_path)
@@ -650,6 +860,7 @@ class ModelResult:
     fps: Optional[float] = None
     peak_rss_mb: Optional[float] = None
     cpu_percent: Optional[float] = None
+    effective_threads: str = ""
     num_timed_runs: int = 0
     per_run_ms: list[float] = field(default_factory=list)
 
@@ -707,6 +918,7 @@ def benchmark_model(
         name=name,
         runtime=runtime,
         img_size=img_size,
+        effective_threads="runtime-default" if runtime == "executorch" else str(threads),
         onnx_path=str(artifact_path) if artifact_path and runtime in ("onnxruntime", "openvino") else "",
         artifact_path=str(artifact_path) if artifact_path else "",
     )
@@ -756,7 +968,7 @@ def benchmark_model(
                 except ImportError:
                     from tensorflow.lite import Interpreter  # type: ignore
 
-            interpreter = Interpreter(model_path=str(artifact_path))
+            interpreter = Interpreter(model_path=str(artifact_path), num_threads=threads)
             interpreter.allocate_tensors()
             input_detail = interpreter.get_input_details()[0]
             input_shape = tuple(int(value) for value in input_detail["shape"])
@@ -806,7 +1018,9 @@ def benchmark_model(
 
             def infer(tensor):
                 extractor = net.create_extractor()
-                extractor.input(input_name, tensor)
+                code = extractor.input(input_name, tensor)
+                if code != 0:
+                    raise RuntimeError(f"ncnn input binding failed for {input_name}: {code}")
                 for output_name in output_names:
                     code, _ = extractor.extract(output_name)
                     if code != 0:
@@ -866,7 +1080,9 @@ def benchmark_model(
         elif runtime == "ncnn":
             import ncnn  # type: ignore
 
-            tensors = [ncnn.Mat(tensor[0]) for tensor in tensors]
+            # ncnn.Mat(ndarray) is zero-copy and does not retain the ndarray.
+            # clone() gives every Mat owned storage before replacing this list.
+            tensors = [ncnn.Mat(tensor[0]).clone() for tensor in tensors]
     except Exception as e:
         result.status = "failed"
         result.error = f"preprocessing failed: {e}"
@@ -971,6 +1187,7 @@ def write_html(results: list[ModelResult], path: Path, meta: dict) -> None:
             r.fps,
             r.peak_rss_mb,
             r.cpu_percent,
+            r.effective_threads,
             r.file_size_mb,
             r.num_timed_runs,
         ]
@@ -997,11 +1214,12 @@ th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){{text-align:left}}
 <h1>CPU detector benchmark</h1><h2>Run metadata</h2><dl>{metadata}</dl>
 <h2>Results</h2><div class="table-wrap"><table><thead><tr>
 <th>Model</th><th>Runtime</th><th>Resolution</th><th>Status</th><th>Avg ms</th><th>Std ms</th>
-<th>Min ms</th><th>Max ms</th><th>FPS</th><th>Peak RSS MB</th><th>CPU %</th><th>Artifact MB</th><th>Runs</th>
+<th>Min ms</th><th>Max ms</th><th>FPS</th><th>Peak RSS MB</th><th>CPU %</th><th>Threads</th><th>Artifact MB</th><th>Runs</th>
 </tr></thead><tbody>{''.join(rows)}</tbody></table></div>
 {f'<h2>Errors</h2><ul>{errors}</ul>' if errors else ''}
 <h2>Notes</h2><ul><li>Latency excludes model loading, export, and preprocessing.</li>
 <li>CPU percentage is per process and is not normalized by core count.</li>
+<li>The Threads column reports <code>runtime-default</code> for ExecuTorch because its Python runtime exposes no stable per-program XNNPACK thread control.</li>
 <li>Raw timings are in <code>per_run_timings.csv</code>; machine-readable summaries are in <code>results.json</code>.</li></ul>
 </body></html>"""
     atomic_write_text(path, document)
@@ -1114,6 +1332,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore a matching checkpoint and rerun completed benchmark cells",
     )
+    p.add_argument(
+        "--allow-unsigned-artifacts",
+        action="store_true",
+        help=(
+            "With --skip-export, explicitly allow legacy artifacts without a valid "
+            "hash manifest. Their content is still hashed for resume identity."
+        ),
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -1158,10 +1384,6 @@ def main() -> int:
     except ValueError as e:
         log.error("%s", e)
         return 2
-    if not runtimes or not (yolox_variants or rfdetr_variants):
-        log.error("No models or runtimes selected; nothing to do.")
-        return 1
-
     models = [
         (f"yolox_{variant}", "yolox", variant, preprocess_yolox)
         for variant in yolox_variants
@@ -1169,15 +1391,29 @@ def main() -> int:
         (f"rfdetr_{variant}", "rfdetr", variant, preprocess_rfdetr)
         for variant in rfdetr_variants
     ]
+    jobs = [
+        (name, family, variant, preprocess_fn, runtime, size)
+        for name, family, variant, preprocess_fn in models
+        for runtime in runtimes
+        if runtime in MODEL_RUNTIMES[family]
+        for size in img_sizes
+    ]
+    if not jobs:
+        log.error("The selected models and runtimes have no supported combinations; nothing to do.")
+        return 2
+    log.info("Planned %d model/runtime/resolution benchmark cells", len(jobs))
+    job_runtimes = list(dict.fromkeys(job[4] for job in jobs))
+    active_yolox_variants = list(dict.fromkeys(job[2] for job in jobs if job[1] == "yolox"))
+    active_rfdetr_variants = list(dict.fromkeys(job[2] for job in jobs if job[1] == "rfdetr"))
 
     # One-time framework/checkpoint setup. Failures remain local to affected cells.
     yolox_repo_dir: Optional[Path] = None
-    yolox_checkpoints: dict[str, Optional[Path]] = {variant: None for variant in yolox_variants}
-    if yolox_variants and (not args.skip_export or "pytorch" in runtimes):
+    yolox_checkpoints: dict[str, Optional[Path]] = {variant: None for variant in active_yolox_variants}
+    if active_yolox_variants and (not args.skip_export or "pytorch" in job_runtimes):
         try:
             yolox_repo_dir = setup_yolox_repo(work_dir)
             if yolox_repo_dir:
-                for variant in yolox_variants:
+                for variant in active_yolox_variants:
                     checkpoint = work_dir / f"yolox_{variant}.pth"
                     if (checkpoint.exists() and checkpoint.stat().st_size > 0) or download_file(
                         YOLOX_CKPT_URLS[variant], checkpoint
@@ -1187,26 +1423,27 @@ def main() -> int:
             log.error("Unexpected error during YOLOX setup: %s", e)
             log.debug(traceback.format_exc())
 
-    if yolox_variants and "ncnn" in runtimes and not args.skip_export:
+    if active_yolox_variants and "ncnn" in job_runtimes and not args.skip_export:
         if not pip_install(["-q", "ncnn", "pnnx"], timeout=1800):
             log.error("Failed to install ncnn/pnnx; YOLOX ncnn cells may fail.")
 
-    if rfdetr_variants and (not args.skip_export or "pytorch" in runtimes):
+    if active_rfdetr_variants and (not args.skip_export or "pytorch" in job_runtimes):
         extras: list[str] = []
         if not args.skip_export:
-            if any(runtime in runtimes for runtime in ("onnxruntime", "openvino")):
+            if any(runtime in job_runtimes for runtime in ("onnxruntime", "openvino")):
                 extras.append("onnx")
-            if "tflite" in runtimes:
+            if "tflite" in job_runtimes:
                 extras.append("tflite")
-            if "executorch" in runtimes:
+            if "executorch" in job_runtimes:
                 extras.append("executorch")
         package = f"rfdetr[{','.join(extras)}]" if extras else "rfdetr"
         if not pip_install(["-q", package], timeout=3600):
             log.error("Failed to install %s; RF-DETR cells may fail.", package)
 
-    # Resolve/export every model-specific runtime artifact. ONNX is shared by
-    # ONNX Runtime and OpenVINO; other runtimes get their native artifacts.
+    # Resolve/export every artifact required by the canonical job list. ONNX is
+    # shared by ONNX Runtime and OpenVINO; other runtimes use native artifacts.
     artifact_by_key: dict[tuple[str, int, str], Optional[Path]] = {}
+    artifact_manifest_by_key: dict[tuple[str, int, str], dict] = {}
     artifact_kind = {
         "onnxruntime": "onnx",
         "openvino": "onnx",
@@ -1215,82 +1452,94 @@ def main() -> int:
         "executorch": "executorch",
     }
     extensions = {"onnx": ".onnx", "ncnn": ".param", "tflite": ".tflite", "executorch": ".pte"}
-    for name, family, variant, _ in models:
-        applicable = [runtime for runtime in runtimes if runtime in MODEL_RUNTIMES[family]]
-        kinds = list(dict.fromkeys(artifact_kind[runtime] for runtime in applicable if runtime != "pytorch"))
-        for size in img_sizes:
-            for kind in kinds:
-                root = args.artifact_dir.resolve() if args.artifact_dir else default_artifact_dir
-                destination = root / name / str(size) / kind / f"{name}{extensions[kind]}"
-                if args.skip_export and kind == "onnx" and not destination.exists():
-                    legacy_onnx = root / name / str(size) / f"{name}.onnx"
-                    if legacy_onnx.exists():
-                        destination = legacy_onnx
-                manifest_path = destination.with_suffix(".export.json")
-                export_signature = {
-                    "model": name,
-                    "artifact_kind": kind,
-                    "img_size": size,
-                    "num_classes": args.num_classes,
-                    "opset": args.opset,
-                }
-                artifact: Optional[Path] = None
-                manifest_matches = False
-                if manifest_path.exists():
-                    try:
-                        manifest_matches = json.loads(manifest_path.read_text()) == export_signature
-                    except (OSError, json.JSONDecodeError):
-                        pass
-                artifact_complete = destination.exists() and destination.stat().st_size > 0
-                if kind == "ncnn":
-                    bin_path = destination.with_suffix(".bin")
-                    artifact_complete = artifact_complete and bin_path.exists() and bin_path.stat().st_size > 0
-                if artifact_complete and (args.skip_export or manifest_matches):
-                    log.info("Reusing export %s", destination)
+    artifact_requests = list(
+        dict.fromkeys(
+            (name, family, variant, size, artifact_kind[runtime])
+            for name, family, variant, _, runtime, size in jobs
+            if runtime != "pytorch"
+        )
+    )
+    for name, family, variant, size, kind in artifact_requests:
+        root = args.artifact_dir.resolve() if args.artifact_dir else default_artifact_dir
+        destination = root / name / str(size) / kind / f"{name}{extensions[kind]}"
+        if args.skip_export and kind == "onnx" and not destination.exists():
+            legacy_onnx = root / name / str(size) / f"{name}.onnx"
+            if legacy_onnx.exists():
+                destination = legacy_onnx
+        manifest_path = destination.with_suffix(".export.json")
+        export_config = {
+            "model": name,
+            "family": family,
+            "artifact_kind": kind,
+            "img_size": size,
+            "num_classes": args.num_classes,
+            "opset": args.opset,
+        }
+        versions = exporter_versions(family, kind)
+        artifact: Optional[Path] = None
+        manifest: Optional[dict] = None
+        valid, loaded_manifest, reason = validate_artifact_manifest(
+            destination,
+            kind,
+            manifest_path,
+            export_config,
+        )
+        if valid:
+            log.info("Reusing verified export %s", destination)
+            artifact, manifest = destination, loaded_manifest
+        elif args.skip_export:
+            complete = all(item.is_file() and item.stat().st_size > 0 for item in artifact_components(destination, kind))
+            if complete and args.allow_unsigned_artifacts:
+                log.warning("Using explicitly allowed unsigned artifact %s (%s)", destination, reason)
+                try:
+                    manifest = build_artifact_manifest(
+                        destination, kind, export_config, {"legacy": "unsigned"}
+                    )
                     artifact = destination
-                elif args.skip_export:
-                    log.warning("Missing pre-exported model: %s", destination)
+                except OSError as e:
+                    log.error("Could not hash legacy artifact %s: %s", destination, e)
+            else:
+                log.warning("Rejecting unverified pre-exported model %s: %s", destination, reason)
+        else:
+            try:
+                if family == "yolox" and kind == "onnx":
+                    checkpoint = yolox_checkpoints[variant]
+                    if yolox_repo_dir and checkpoint and export_yolox_onnx(
+                        yolox_repo_dir, variant, size, checkpoint, destination, args.opset, args.num_classes
+                    ):
+                        artifact = destination
+                elif family == "yolox" and kind == "ncnn":
+                    checkpoint = yolox_checkpoints[variant]
+                    if yolox_repo_dir and checkpoint and export_yolox_ncnn(
+                        yolox_repo_dir, variant, size, checkpoint, destination, args.num_classes
+                    ):
+                        artifact = destination
+                elif kind == "onnx":
+                    artifact = export_rfdetr_onnx(
+                        variant, size, destination.parent, args.opset, args.num_classes
+                    )
                 else:
-                    try:
-                        if family == "yolox" and kind == "onnx":
-                            checkpoint = yolox_checkpoints[variant]
-                            if yolox_repo_dir and checkpoint and export_yolox_onnx(
-                                yolox_repo_dir,
-                                variant,
-                                size,
-                                checkpoint,
-                                destination,
-                                args.opset,
-                                args.num_classes,
-                            ):
-                                artifact = destination
-                        elif family == "yolox" and kind == "ncnn":
-                            checkpoint = yolox_checkpoints[variant]
-                            if yolox_repo_dir and checkpoint and export_yolox_ncnn(
-                                yolox_repo_dir,
-                                variant,
-                                size,
-                                checkpoint,
-                                destination,
-                                args.num_classes,
-                            ):
-                                artifact = destination
-                        elif kind == "onnx":
-                            artifact = export_rfdetr_onnx(
-                                variant, size, destination.parent, args.opset, args.num_classes
-                            )
-                        else:
-                            artifact = export_rfdetr_deployment(
-                                variant, size, destination, kind, args.num_classes
-                            )
-                    except Exception as e:
-                        log.error("Export failed for %s @ %dx%d: %s", name, size, size, e)
-                        log.debug(traceback.format_exc())
-                    if artifact is not None:
-                        atomic_write_text(manifest_path, json.dumps(export_signature, indent=2))
-                for runtime in applicable:
-                    if artifact_kind.get(runtime) == kind:
-                        artifact_by_key[(name, size, runtime)] = artifact
+                    artifact = export_rfdetr_deployment(
+                        variant, size, destination, kind, args.num_classes
+                    )
+            except Exception as e:
+                log.error("Export failed for %s @ %dx%d: %s", name, size, size, e)
+                log.debug(traceback.format_exc())
+            if artifact is not None:
+                try:
+                    manifest = build_artifact_manifest(artifact, kind, export_config, versions)
+                    # This commit marker is written last. A crash while replacing
+                    # an ncnn param/bin pair therefore cannot publish a mixed pair.
+                    atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
+                except OSError as e:
+                    log.error("Could not commit export manifest for %s: %s", artifact, e)
+                    artifact, manifest = None, None
+        for job_name, _, _, _, runtime, job_size in jobs:
+            if job_name == name and job_size == size and artifact_kind.get(runtime) == kind:
+                key = (name, size, runtime)
+                artifact_by_key[key] = artifact
+                if manifest is not None:
+                    artifact_manifest_by_key[key] = manifest
 
     if args.export_only:
         log.info("--export-only set; exiting after export.")
@@ -1303,15 +1552,45 @@ def main() -> int:
         log.error("Could not obtain any test images: %s", e)
         return 1
 
+    artifact_identities = {
+        f"{name}/{runtime}/{size}": artifact_manifest_by_key.get(
+            (name, size, runtime), {"artifact_id": "missing"}
+        )["artifact_id"]
+        for name, _, _, _, runtime, size in jobs
+        if runtime != "pytorch"
+    }
+    artifact_exporter_versions = {
+        f"{name}/{runtime}/{size}": artifact_manifest_by_key[(name, size, runtime)][
+            "exporter_versions"
+        ]
+        for name, _, _, _, runtime, size in jobs
+        if (name, size, runtime) in artifact_manifest_by_key
+    }
+    source_identities: dict[str, object] = {}
+    if any(family == "rfdetr" and runtime == "pytorch" for _, family, _, _, runtime, _ in jobs):
+        source_identities["rfdetr"] = package_version("rfdetr")
+    if yolox_repo_dir and any(
+        family == "yolox" and runtime == "pytorch" for _, family, _, _, runtime, _ in jobs
+    ):
+        ok, revision = run_cmd(["git", "rev-parse", "HEAD"], cwd=yolox_repo_dir, timeout=30)
+        source_identities["yolox_revision"] = revision.strip() if ok else "unknown"
+        source_identities["yolox_checkpoints"] = {
+            variant: sha256_file(checkpoint)
+            for variant, checkpoint in yolox_checkpoints.items()
+            if checkpoint is not None and checkpoint.is_file()
+        }
     signature = {
-        "models": [name for name, _, _, _ in models],
-        "runtimes": runtimes,
-        "img_sizes": img_sizes,
+        "jobs": [f"{name}/{runtime}/{size}" for name, _, _, _, runtime, size in jobs],
         "num_classes": args.num_classes,
+        "opset": args.opset,
         "threads": args.threads,
         "warmup_runs": args.warmup_runs,
         "timed_runs": args.timed_runs,
         "images": str(args.images.resolve()) if args.images else "fallback",
+        "artifact_identities": artifact_identities,
+        "artifact_exporter_versions": artifact_exporter_versions,
+        "runtime_versions": runtime_versions(job_runtimes),
+        "source_identities": source_identities,
     }
     checkpoint_path = out_dir / "checkpoint.json"
     results: list[ModelResult] = []
@@ -1327,33 +1606,29 @@ def main() -> int:
             log.warning("Ignoring unreadable checkpoint %s: %s", checkpoint_path, e)
 
     completed = {(r.name, r.runtime, r.img_size) for r in results}
-    for name, family, variant, preprocess_fn in models:
-        for runtime in runtimes:
-            if runtime not in MODEL_RUNTIMES[family]:
-                continue
-            for size in img_sizes:
-                key = (name, runtime, size)
-                if key in completed:
-                    continue
-                result = benchmark_model(
-                    name=name,
-                    family=family,
-                    variant=variant,
-                    runtime=runtime,
-                    artifact_path=artifact_by_key.get((name, size, runtime)),
-                    preprocess_fn=preprocess_fn,
-                    image_paths=image_paths,
-                    img_size=size,
-                    warmup_runs=args.warmup_runs,
-                    timed_runs=args.timed_runs,
-                    threads=args.threads,
-                    num_classes=args.num_classes,
-                    yolox_repo=yolox_repo_dir,
-                    yolox_ckpt=yolox_checkpoints.get(variant),
-                )
-                results.append(result)
-                completed.add(key)
-                write_checkpoint(results, checkpoint_path, signature)
+    for name, family, variant, preprocess_fn, runtime, size in jobs:
+        key = (name, runtime, size)
+        if key in completed:
+            continue
+        result = benchmark_model(
+            name=name,
+            family=family,
+            variant=variant,
+            runtime=runtime,
+            artifact_path=artifact_by_key.get((name, size, runtime)),
+            preprocess_fn=preprocess_fn,
+            image_paths=image_paths,
+            img_size=size,
+            warmup_runs=args.warmup_runs,
+            timed_runs=args.timed_runs,
+            threads=args.threads,
+            num_classes=args.num_classes,
+            yolox_repo=yolox_repo_dir,
+            yolox_ckpt=yolox_checkpoints.get(variant),
+        )
+        results.append(result)
+        completed.add(key)
+        write_checkpoint(results, checkpoint_path, signature)
 
     meta = {
         "date_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
@@ -1361,8 +1636,9 @@ def main() -> int:
         "python_version": platform.python_version(),
         "cpu_count": os.cpu_count(),
         "img_sizes": ", ".join(f"{s}x{s}" for s in img_sizes),
-        "models": ", ".join(signature["models"]),
-        "runtimes": ", ".join(runtimes),
+        "models": ", ".join(dict.fromkeys(job[0] for job in jobs)),
+        "runtimes": ", ".join(job_runtimes),
+        "runtime_versions": json.dumps(signature["runtime_versions"], sort_keys=True),
         "num_classes": args.num_classes,
         "threads": args.threads,
         "warmup_runs": args.warmup_runs,
