@@ -385,7 +385,7 @@ def export_flow(wizard: Wizard) -> int:
         packages = list(COMMON_PACKAGES)
         if group == "stable":
             if any(runtime in selected for runtime in ("onnxruntime", "openvino")):
-                packages.extend(("onnx", "onnxsim"))
+                packages.extend(("onnx", "onnxscript", "onnxsim"))
             if "ncnn" in selected:
                 packages.extend(("ncnn", "pnnx"))
         python = prepare_environment(

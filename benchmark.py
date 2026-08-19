@@ -44,6 +44,7 @@ import csv
 import hashlib
 import html
 import importlib.metadata
+import inspect
 import json
 import logging
 import os
@@ -489,16 +490,22 @@ def setup_yolox_repo(work_dir: Path) -> Optional[Path]:
         "Pi 4 — see README.md for timing guidance and how to avoid it via "
         "--export-only on a faster machine."
     )
-    if not uv_install(["-q", "-r", str(repo_dir / "requirements.txt")], timeout=3600):
+    requirements = [
+        line.strip()
+        for line in (repo_dir / "requirements.txt").read_text().splitlines()
+        if line.strip()
+        and not line.lstrip().startswith("#")
+        # YOLOX pins an obsolete onnx-simplifier release that cannot install
+        # on current Python versions. Simplification remains optional below.
+        and not line.strip().startswith("onnx-simplifier")
+    ]
+    if not uv_install(["-q", *requirements], timeout=3600):
         log.error(
-            "Failed to install YOLOX requirements.txt. This most commonly means "
+            "Failed to install YOLOX runtime requirements. This most commonly means "
             "torch failed to install. On a Pi, prefer the official PyTorch CPU "
             "wheels: uv pip install torch --default-index https://download.pytorch.org/whl/cpu "
             "(see README.md)."
         )
-        return None
-    if not uv_install(["-q", "-e", str(repo_dir)], timeout=1200):
-        log.error("Failed to install the YOLOX repo itself.")
         return None
     return repo_dir
 
@@ -634,7 +641,15 @@ def export_yolox_onnx(
         dummy = torch.randn(1, 3, img_size, img_size)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         partial_path = out_path.with_name(out_path.stem + ".partial.onnx")
+        partial_data_path = partial_path.with_name(partial_path.name + ".data")
         partial_path.unlink(missing_ok=True)
+        partial_data_path.unlink(missing_ok=True)
+        export_kwargs = {}
+        export_parameters = inspect.signature(torch.onnx.export).parameters
+        if "external_data" in export_parameters:
+            export_kwargs["external_data"] = False
+        elif "use_external_data_format" in export_parameters:
+            export_kwargs["use_external_data_format"] = False
         torch.onnx.export(
             model,
             dummy,
@@ -643,7 +658,11 @@ def export_yolox_onnx(
             output_names=["output"],
             opset_version=opset,
             do_constant_folding=True,
+            **export_kwargs,
         )
+
+        if partial_data_path.exists():
+            raise RuntimeError("ONNX export created an unsupported external-data sidecar")
 
         try:
             import onnxsim  # type: ignore
@@ -819,23 +838,27 @@ def export_rfdetr_deployment(
             "shape": (img_size, img_size),
             "batch_size": 1,
             "verbose": True,
-            "output_name": f"rfdetr-{variant}",
         }
         if runtime == "tflite":
-            model.export(format="tflite", quantization="fp32", **kwargs)
-            candidates = list(partial_dir.rglob("*_fp32.tflite"))
+            # RF-DETR's TFLite converter invokes `onnxsim` by name. Running
+            # this script through a venv's absolute Python path does not
+            # activate its scripts directory, so make it discoverable.
+            scripts_dir = str(Path(sys.executable).parent)
+            path_entries = os.environ.get("PATH", "").split(os.pathsep)
+            if scripts_dir not in path_entries:
+                os.environ["PATH"] = os.pathsep.join([scripts_dir, *path_entries])
+            artifact = Path(model.export(format="tflite", quantization="fp32", **kwargs))
         elif runtime == "executorch":
-            model.export(format="executorch", backend="xnnpack", **kwargs)
-            candidates = list(partial_dir.rglob("*.pte"))
+            artifact = Path(model.export(format="executorch", backend="xnnpack", **kwargs))
         else:
             raise ValueError(f"unsupported RF-DETR deployment runtime: {runtime}")
-        if not candidates or candidates[0].stat().st_size <= 0:
+        if not artifact.is_file() or artifact.stat().st_size <= 0:
             raise RuntimeError(f"{runtime} export produced no non-empty artifact")
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        candidates[0].replace(out_path)
+        artifact.replace(out_path)
         shutil.rmtree(partial_dir, ignore_errors=True)
         return out_path
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         log.error("RF-DETR %s export failed for variant=%s: %s", runtime, variant, e)
         log.debug(traceback.format_exc())
         return None
