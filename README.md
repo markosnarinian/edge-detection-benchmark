@@ -3,7 +3,8 @@
 `benchmark.py` compares all core RF-DETR detection variants (Nano, Small,
 Medium, Large) with all seven official YOLOX variants (Nano, Tiny, S, M, L, X,
 Darknet53). Every model is measured with the CPU/Linux runtimes both families
-officially support from Python: native PyTorch, ONNX Runtime, and OpenVINO.
+support on Raspberry Pi: PyTorch, ONNX Runtime, and OpenVINO for both families;
+ncnn for YOLOX; and experimental TFLite and ExecuTorch/XNNPACK for RF-DETR.
 
 The default sweep covers 14 practical square resolutions from 256 to 1024.
 Use the variant, runtime, and resolution flags to run a smaller matrix first:
@@ -12,12 +13,12 @@ Use the variant, runtime, and resolution flags to run a smaller matrix first:
 python3 benchmark.py \
   --yolox-variants nano,tiny \
   --rfdetr-variants nano,small \
-  --runtimes onnxruntime \
+  --runtimes onnxruntime,ncnn \
   --img-sizes 320,416,512,640
 ```
 
 Results are written as an HTML report to `results/index.html`, with JSON, raw
-CSV timings, resumable checkpoints, and reusable ONNX exports alongside it.
+CSV timings, resumable checkpoints, and reusable runtime artifacts alongside it.
 The generated `results/` directory is intentionally ignored by Git.
 
 See [`SETUP.md`](SETUP.md) for installation, the complete test matrix,
