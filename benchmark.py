@@ -4,8 +4,8 @@ CPU-only detector benchmark across every core RF-DETR detection variant and
 every official YOLOX variant, using every relevant Raspberry Pi CPU runtime:
 PyTorch, ONNX Runtime, OpenVINO, ncnn, TFLite, and ExecuTorch/XNNPACK.
 
-Target hardware: Raspberry Pi 4 (ARM Cortex-A72, CPU-only, no accelerator).
-See SETUP.md for install instructions, Pi-specific caveats, and expected runtime.
+Target hardware: Raspberry Pi 4 or Pi 5 (CPU-only, no accelerator).
+See README.md for the two-stage setup, dependency caveats, and Pi guidance.
 
 This script is meant to run unattended on a Raspberry Pi with nobody available
 to debug it interactively. Every external operation (pip install, git clone,
@@ -483,7 +483,7 @@ def setup_yolox_repo(work_dir: Path) -> Optional[Path]:
     log.info(
         "Installing YOLOX + its Python dependencies (torch, torchvision, "
         "pycocotools, ...). This is the slowest step of the whole script on a "
-        "Pi 4 — see SETUP.md for expected timing and how to avoid it via "
+        "Pi 4 — see README.md for timing guidance and how to avoid it via "
         "--export-only on a faster machine."
     )
     if not pip_install(["-q", "-r", str(repo_dir / "requirements.txt")], timeout=3600):
@@ -491,7 +491,7 @@ def setup_yolox_repo(work_dir: Path) -> Optional[Path]:
             "Failed to install YOLOX requirements.txt. This most commonly means "
             "torch failed to install. On a Pi, prefer the official PyTorch CPU "
             "wheels: pip install torch --index-url https://download.pytorch.org/whl/cpu "
-            "(see SETUP.md)."
+            "(see README.md)."
         )
         return None
     if not pip_install(["-q", "-e", str(repo_dir)], timeout=1200):
