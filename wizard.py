@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import plistlib
 import shlex
 import shutil
 import subprocess
@@ -115,6 +116,29 @@ def uv_install_command(python: Path, *packages: str) -> list[str]:
     return ["uv", "pip", "install", "--python", str(python), *packages]
 
 
+def is_exfat(path: Path) -> bool:
+    if sys.platform != "darwin":
+        return False
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        while True:
+            result = subprocess.run(
+                ["diskutil", "info", "-plist", str(probe)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode == 0:
+                return plistlib.loads(result.stdout).get("FilesystemType") == "exfat"
+            if probe == probe.parent:
+                return False
+            probe = probe.parent
+    except (OSError, plistlib.InvalidFileException):
+        return False
+
+
 def prepare_environment(
     wizard: Wizard,
     *,
@@ -123,7 +147,10 @@ def prepare_environment(
     base_python: str,
     packages: list[str],
 ) -> Path | None:
-    venv = work_dir / "wizard-envs" / label
+    if is_exfat(work_dir):
+        venv = repository_root() / ".venv" / "wizard-envs" / label
+    else:
+        venv = work_dir / "wizard-envs" / label
     python = python_in_venv(venv)
     marker = venv / ".wizard-setup.json"
     setup_signature = {"packages": packages}
@@ -135,10 +162,10 @@ def prepare_environment(
                 return python
         except (OSError, json.JSONDecodeError):
             pass
-    if not python.exists() and not wizard.run(
-        ["uv", "venv", "--python", base_python, str(venv)], cwd=repository_root()
-    ):
-        return None
+    if not python.exists():
+        command = ["uv", "venv", "--python", base_python, str(venv)]
+        if not wizard.run(command, cwd=repository_root()):
+            return None
     if packages and not wizard.run(
         uv_install_command(python, *packages), cwd=repository_root()
     ):

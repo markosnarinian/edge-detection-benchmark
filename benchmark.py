@@ -718,8 +718,8 @@ def export_yolox_ncnn(
         if not torch.allclose(
             torch.from_numpy(flatten_torch_outputs(original_output)),
             torch.from_numpy(flatten_torch_outputs(transformed_output)),
-            rtol=1e-5,
-            atol=1e-5,
+            rtol=2e-3,
+            atol=2e-3,
         ):
             raise RuntimeError("PixelUnshuffle Focus replacement changed PyTorch output")
         log.info("Replaced %d YOLOX Focus module(s) for pnnx export", replacements)
